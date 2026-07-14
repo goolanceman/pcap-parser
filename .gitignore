@@ -1,0 +1,21 @@
+# Capture files and outputs
+*.pcap
+*.pcapng
+*.cap
+*.wav
+*.amr
+*.awb
+*.evs
+*.3ga
+*.log
+
+# Extraction output folders
+*_extracted_*/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
