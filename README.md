@@ -22,7 +22,7 @@ Extract AMR, AMR-WB, and EVS audio from RTP pcaps and save it in the storage for
 - Per-flow **audio-level check** in the summary; silent or near-silent flows are flagged.
 - Multi-flow mode extracts **all supported codec flows** by default when no `-c` is given.
 - Optional **per-flow RTP pcap export** (`--pcaps`) so each SSRC gets its own `.pcap` for Wireshark analysis or later decoding.
-- Optional **multichannel mix** (`--mix`) that combines all flow WAVs into one WAV with one channel per flow, so you can open a single file in Audacity and split it into per-SSRC tracks.
+- Optional **multichannel mix** (`--mix`) that combines all flow WAVs into one WAV with one channel per flow, aligned by **pcap capture time** (like Wireshark's RTP player). Use `--no-align-time` to start all channels at 0.
 - Deduplicates RTP packets by sequence number and sorts them before writing.
 - **Preserves silent/DTX periods** by inserting silence frames for RTP timestamp gaps and replacing SID frames with silence so ffmpeg does not drop them.
 - Prints a clear extraction summary with flow details.
@@ -124,6 +124,8 @@ python3 pcap_parser.py -i capture.pcap --wav --pcaps --mix -ar 16000
 ```
 
 In Audacity, import `mixed_all_flows.wav`. If Audacity asks how to import a multichannel file, choose **“Split to mono tracks”** (or use **Tracks → Mix → Stereo Track to Mono** / **Split Stereo to Mono**) so each SSRC appears as its own track.
+
+By default the channels are aligned by **pcap capture time** (like Wireshark's RTP player), so a flow that starts 10 seconds after another will begin with 10 seconds of silence. If you want all channels to start at time 0 instead, add `--no-align-time`.
 
 ---
 
@@ -268,6 +270,7 @@ Open `mixed_all_flows.wav` in Audacity and split the channels into mono tracks t
 | `-ar <rate>` / `--sample-rate <rate>` | WAV sample rate in Hz (default: `16000`) |
 | `--pcaps` | Also write one `.pcap` per RTP flow (SSRC + PT) |
 | `--mix` | Also create one multichannel WAV mixing all flow WAVs |
+| `--no-align-time` | When mixing, start all channels at time 0 instead of aligning by pcap capture time |
 | `-h` | Show help |
 
 ---
@@ -288,7 +291,7 @@ Open `mixed_all_flows.wav` in Audacity and split the channels into mono tracks t
    - `#!EVS_MC1.0\n` plus header for EVS
 8. If `--wav` is set, runs `ffmpeg` to convert to WAV at the requested sample rate (`-ar`), using a clean WAV header and a soft peak limiter to avoid hard clipping.
 9. If `--pcaps` is set, writes the original packets for each flow to a separate `.pcap` file.
-10. If `--mix` is set, combines all flow WAVs into a single multichannel WAV (`mixed_all_flows.wav`) with one channel per flow.
+10. If `--mix` is set, combines all flow WAVs into a single multichannel WAV (`mixed_all_flows.wav`) with one channel per flow, aligned by pcap capture time unless `--no-align-time` is used.
 11. Reports the RMS/peak level for each WAV in the summary and flags flows that are silent or extremely quiet.
 
 ---

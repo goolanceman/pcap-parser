@@ -557,11 +557,14 @@ def analyze_wav_level(wav_file):
         return None
 
 
-def mix_wavs(wav_files, out_wav, sample_rate):
+def mix_wavs(wav_files, out_wav, sample_rate, delays=None):
     '''
     Mix multiple mono WAV files into one multichannel WAV using ffmpeg.
     Each input becomes one output channel; shorter inputs are padded with
     silence so all channels have the same length.
+    If delays is provided, each channel is delayed by the given number of
+    samples (at the target sample rate) so flows are aligned by their absolute
+    pcap capture time.
     Returns True on success, False on failure.
     '''
     ffmpeg = shutil.which('ffmpeg')
@@ -572,10 +575,17 @@ def mix_wavs(wav_files, out_wav, sample_rate):
     if not wav_files:
         return False
 
-    # Determine the longest input in samples at the target sample rate.
+    if delays is None:
+        delays = [0] * len(wav_files)
+    elif len(delays) != len(wav_files):
+        delays = list(delays) + [0] * (len(wav_files) - len(delays))
+
+    # Determine the longest input in samples at the target sample rate,
+    # including any alignment delay.
     max_samples = 0
     valid_files = []
-    for wf in wav_files:
+    valid_delays = []
+    for idx, wf in enumerate(wav_files):
         try:
             with wave.open(wf, 'rb') as w:
                 frames = w.getnframes()
@@ -585,9 +595,11 @@ def mix_wavs(wav_files, out_wav, sample_rate):
                 continue
             # Scale frame count to target sample rate (integer, rounded up).
             scaled = int(math.ceil(frames * sample_rate / rate))
-            if scaled > max_samples:
-                max_samples = scaled
+            total = scaled + delays[idx]
+            if total > max_samples:
+                max_samples = total
             valid_files.append(wf)
+            valid_delays.append(delays[idx])
         except Exception as e:
             logging.debug('Skipping {} for mix: {}'.format(wf, e))
 
@@ -595,15 +607,20 @@ def mix_wavs(wav_files, out_wav, sample_rate):
         print('No valid WAV files to mix')
         return False
 
-    # Build filter_complex: resample each input to mono at target rate, pad,
-    # then merge channels.
+    # Build filter_complex: resample each input to mono at target rate, delay,
+    # pad, then merge channels.
     inputs = []
     pads = []
     merge = []
     for i, wf in enumerate(valid_files):
         inputs.extend(['-i', wf])
-        pads.append('[{}:a]aresample={},aformat=channel_layouts=mono,apad=whole_len={}[a{}]'.format(
-            i, sample_rate, max_samples, i))
+        delay_ms = int(round(valid_delays[i] * 1000.0 / sample_rate))
+        if delay_ms > 0:
+            delay_str = 'adelay=delays={ms}|{ms}:all=1,'.format(ms=delay_ms)
+        else:
+            delay_str = ''
+        pads.append('[{i}:a]aresample={sr},aformat=channel_layouts=mono,{delay_str}apad=whole_len={max_samples}[a{i}]'.format(
+            i=i, sr=sample_rate, delay_str=delay_str, max_samples=max_samples))
         merge.append('[a{}]'.format(i))
 
     filter_complex = ';'.join(pads) + ';' + ''.join(merge) + 'amerge=inputs={}[out]'.format(len(valid_files))
@@ -858,6 +875,7 @@ def extract_flow(rtp_packets, ssrc, pt, codec, framing, outfile):
         'control_frames': num_control_frames,
         'first_ts': selected[0]['timestamp'] if selected else None,
         'last_ts': selected[-1]['timestamp'] if selected else None,
+        'first_pcap_time': selected[0]['pcap_time'] if selected else None,
     }
 
 
@@ -1204,6 +1222,7 @@ def usage():
     print('  -ar rate       WAV output sample rate in Hz (default: 16000)')
     print('  --pcaps        also write one pcap per RTP flow (ssrc/pt)')
     print('  --mix          also create one multichannel WAV from all flow WAVs')
+    print('  --no-align-time  with --mix: start all channels at time 0 instead of aligning by pcap time')
     print('If -o is used, only the busiest matching flow is extracted.')
     print('Otherwise, every matching RTP flow is extracted to its own file.')
 
@@ -1477,6 +1496,10 @@ def generate_report(outdir, args, packets, rtp_packets, flows, flow_codecs,
     if args.mix:
         lines.append('2. **Combined view:** Open `mixed_all_flows.wav` in Audacity.')
         lines.append('   - Audacity will ask how to import the multichannel file; choose **Split to mono tracks**.')
+        if args.no_align_time:
+            lines.append('   - All channels start at time 0.')
+        else:
+            lines.append('   - Channels are aligned by pcap capture time (like Wireshark RTP player), so a flow that started later begins with silence.')
         lines.append('   - Each track corresponds to one SSRC in the order shown in the RTP Flows table above.')
     if args.pcaps:
         lines.append('{}. **Wireshark analysis:** Use the `.pcap` files or the `rtp.ssrc == 0x...` filter from the table.'.format(
@@ -1505,6 +1528,8 @@ if __name__ == '__main__':
                         help='Also write one pcap per RTP flow (ssrc/pt) for Wireshark analysis')
     parser.add_argument('--mix', action='store_true', dest='mix', default=False,
                         help='Also create one multichannel WAV mixing all flow WAVs (one channel per flow)')
+    parser.add_argument('--no-align-time', action='store_true', dest='no_align_time', default=False,
+                        help='When mixing, start all channels at time 0 instead of aligning by pcap capture time')
 
     args = parser.parse_args()
 
@@ -1544,6 +1569,9 @@ if __name__ == '__main__':
         data = bytes(packet[UDP].payload)
         rtp = parse_rtp(data)
         if rtp is not None:
+            # Attach the pcap capture timestamp so flows can be aligned by
+            # wall-clock time in the mixed output.
+            rtp['pcap_time'] = float(packet.time)
             rtp_packets.append(rtp)
 
     if not rtp_packets:
@@ -1739,7 +1767,28 @@ if __name__ == '__main__':
         wav_files = [r['wavfile'] for r in results if r.get('wavfile')]
         if wav_files:
             mixed_wav = os.path.join(outdir, 'mixed_all_flows.wav')
-            mix_info = mix_wavs(wav_files, mixed_wav, args.sample_rate)
+            # By default align channels by pcap capture time, like Wireshark's
+            # RTP player. --no-align-time disables this and starts all at 0.
+            if args.no_align_time:
+                mix_info = mix_wavs(wav_files, mixed_wav, args.sample_rate)
+            else:
+                first_times = [r['first_pcap_time'] for r in results
+                               if r.get('wavfile') and r.get('first_pcap_time') is not None]
+                if first_times:
+                    min_first_time = min(first_times)
+                    delays = []
+                    for r in results:
+                        if not r.get('wavfile'):
+                            continue
+                        t0 = r.get('first_pcap_time')
+                        if t0 is not None:
+                            delay_samples = int(round((t0 - min_first_time) * args.sample_rate))
+                            delays.append(delay_samples)
+                        else:
+                            delays.append(0)
+                    mix_info = mix_wavs(wav_files, mixed_wav, args.sample_rate, delays=delays)
+                else:
+                    mix_info = mix_wavs(wav_files, mixed_wav, args.sample_rate)
             if mix_info:
                 print('Mixed all {} flow(s) into: {}'.format(mix_info['channels'], mix_info['out_wav']))
                 print('  duration={:.2f}s  channels={}'.format(
