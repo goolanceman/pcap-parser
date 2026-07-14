@@ -1,30 +1,23 @@
-'''
-Pcap file parser for AMR / AMR-WB / EVS with RFC4867 or Iu framing.
-This script parses a pcap file to extract rtp amr, amr-wb or evs data,
-encapsulated using the bandwidth efficient mode described in RFC4867 or
-using Iu framing (3GPP TS25.415), and stores it in a file with the storage
-format defined in section 5 of RFC4867.
+"""
+pcap-parser: Extract AMR, AMR-WB and EVS audio from RTP pcaps.
 
-The pcap file must contain only one RTP flow with amr, amr-wb or evs codec data.
-Any other codec will produce invalid output or crash.
-If the pcap file includes more than one RTP flow, then only the busiest one
-that matches the selected codec is extracted.
+Reads pcap/pcapng files containing SIP/RTP traffic, extracts RTP flows for
+AMR (NB), AMR-WB and EVS codecs, and writes them in RFC 4867 storage format.
+Optionally converts to WAV, exports one pcap per flow, and mixes all flows
+into a single multichannel WAV aligned by pcap capture time.
 
-The codec type, 'amr', 'amr-wb' or evs can be specified in the command line with
-the -c option. If not specified, then the script will try to guess the codec.
-Guessing works very well in normal cases, so you should always try to let the
-script guess and only specify a codec if the script tells you that it was not
-able to guess.
+Supported RTP framing:
+  - RFC 4867 bandwidth-efficient mode (default)
+  - Iu framing (3GPP TS 25.415) for AMR / AMR-WB
 
-Limitations:
-   - Supports only single channel for all codecs supported. I.e. multichannel is not supported.
-   - Supports only 1 codec frame per packet.
-   - For EVS codec, only the compact payload format is supported (section A.2 of 3GPP TS26.445)
-   - Iu Framing is not supported for the EVS codec
-'''
+Author: Mansoor Khan
+Version: 1.0.0
+License: MIT
+"""
 
 __version__ = '1.0.0'
 __author__ = 'Mansoor Khan'
+__license__ = 'MIT'
 
 import sys
 import os
