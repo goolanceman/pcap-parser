@@ -5,7 +5,7 @@ Extract AMR, AMR-WB, and EVS audio from RTP pcaps and convert it to playable WAV
 `pcap-parser` reads pcap/pcapng captures containing SIP signaling and RTP media, identifies audio flows by SSRC and payload type, and writes each flow in the RFC 4867 storage format. It can also decode to WAV with `ffmpeg`, export one pcap per flow, and mix all flows into a single multichannel WAV aligned by packet capture time — just like Wireshark's RTP player.
 
 **Author:** Mansoor Khan  
-**Version:** 1.0.0  
+**Version:** 1.1.0  
 **License:** MIT
 
 ---
@@ -45,7 +45,8 @@ Extract AMR, AMR-WB, and EVS audio from RTP pcaps and convert it to playable WAV
 - **Preserves silent / DTX periods** by inserting silence frames for RTP timestamp gaps and replacing SID frames with decodable silence so `ffmpeg` does not drop them.
 - Optional **per-flow RTP pcap export** (`--pcaps`) for Wireshark analysis.
 - Optional **multichannel mix** (`--mix`) combining all flow WAVs into one file with one channel per flow, aligned by **pcap capture time** (Wireshark RTP-player style). Use `--no-align-time` to start all channels at 0.
-- Automatic **per-folder README report** in multi-flow mode with SIP call summary, A/B party direction labels, Mermaid + ASCII diagrams, and a listening guide.
+- Optional **per-endpoint direction mixes** (`--direction-mix`): for every RTP socket (IP:port) the script creates incoming, outgoing and stereo WAVs (left = incoming, right = outgoing).
+- Automatic **per-folder README report** in multi-flow mode with SIP call summary, A/B party direction labels, per-endpoint mixes, Mermaid + ASCII diagrams, and a listening guide.
 
 ---
 
@@ -143,10 +144,22 @@ The mixed file is aligned by **pcap capture time** by default. To start every ch
 python3 pcap_parser.py -i capture.pcap -c amr --mix --no-align-time
 ```
 
+### Per-endpoint (IP:port) direction mixes
+
+```bash
+python3 pcap_parser.py -i capture.pcap --wav --direction-mix
+```
+
+This creates, for every RTP socket seen in the capture:
+
+- `ipport_<ip>_<port>_incoming.wav` — all RTP streams **received** on that socket
+- `ipport_<ip>_<port>_outgoing.wav` — all RTP streams **sent** from that socket
+- `ipport_<ip>_<port>_stereo.wav` — stereo: left = incoming, right = outgoing
+
 ### Full analysis workflow
 
 ```bash
-python3 pcap_parser.py -i capture.pcap -c amr --wav --pcaps --mix -ar 16000
+python3 pcap_parser.py -i capture.pcap -c amr --wav --pcaps --mix --direction-mix -ar 16000
 ```
 
 This produces:
@@ -154,6 +167,7 @@ This produces:
 - Per-flow `.amr.wav` audio files
 - Per-flow `.pcap` files for Wireshark
 - `mixed_all_flows.wav` with one channel per flow
+- `ipport_<ip>_<port>_{incoming,outgoing,stereo}.wav` for every RTP socket
 - `README.md` with SIP/RTP analysis and diagrams
 
 ---
@@ -172,6 +186,7 @@ This produces:
 | `--pcaps` | Write one `.pcap` per RTP flow |
 | `--mix` | Create one multichannel WAV mixing all flow WAVs |
 | `--no-align-time` | With `--mix`, start all channels at time 0 instead of aligning by pcap capture time |
+| `--direction-mix` | Create per-IP:port incoming/outgoing/stereo WAV mixes |
 | `-h` | Show help |
 
 ---
@@ -195,6 +210,12 @@ The name contains:
 - `.wav` — WAV version (if `--wav` was used)
 - `.pcap` — per-flow RTP pcap (if `--pcaps` was used)
 
+When `--direction-mix` is used you also get:
+
+- `ipport_<ip>_<port>_incoming.wav`
+- `ipport_<ip>_<port>_outgoing.wav`
+- `ipport_<ip>_<port>_stereo.wav`
+
 ---
 
 ## How It Works
@@ -211,8 +232,9 @@ The name contains:
 8. If `--wav` is set, runs `ffmpeg` to convert to WAV at the requested sample rate.
 9. If `--pcaps` is set, writes the original packets for each flow to a separate `.pcap` file.
 10. If `--mix` is set, combines all flow WAVs into a single multichannel WAV aligned by pcap capture time, unless `--no-align-time` is used.
-11. Reports the RMS / peak level for each WAV and flags flows that are silent or extremely quiet.
-12. Writes a per-folder `README.md` with SIP call summary, A/B direction labels, diagrams, and listening instructions.
+11. If `--direction-mix` is set, creates incoming / outgoing / stereo mixes for every RTP socket (IP:port).
+12. Reports the RMS / peak level for each WAV and flags flows that are silent or extremely quiet.
+13. Writes a per-folder `README.md` with SIP call summary, A/B direction labels, per-endpoint mixes, diagrams, and listening instructions.
 
 ---
 

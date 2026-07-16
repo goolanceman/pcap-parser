@@ -11,11 +11,11 @@ Supported RTP framing:
   - Iu framing (3GPP TS 25.415) for AMR / AMR-WB
 
 Author: Mansoor Khan
-Version: 1.0.0
+Version: 1.1.0
 License: MIT
 """
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 __author__ = 'Mansoor Khan'
 __license__ = 'MIT'
 
@@ -471,9 +471,141 @@ def label_flows_with_sip(flows, packets, sip_dialogs):
     return labels
 
 
+def find_evs_decoder():
+    '''
+    Locate the 3GPP EVS reference decoder binary (EVS_dec).
+    Returns the path or None if not found.
+    '''
+    env_path = os.environ.get('EVS_DEC')
+    if env_path and os.path.isfile(env_path) and os.access(env_path, os.X_OK):
+        return env_path
+    return shutil.which('EVS_dec')
+
+
+def write_evs_voip_file(rtp_packets, ssrc, pt, voip_file):
+    '''
+    Write a G.192 VOIP file for the 3GPP EVS decoder from an RTP flow.
+    The VOIP file contains the RTP payload bits in G.192 format so that
+    EVS_dec -VOIP can parse the RTP/EVS framing correctly.
+    Returns True on success.
+    '''
+    G192_SYNC_GOOD_FRAME = 0x6B21
+    G192_BIT0 = 0x007F
+    G192_BIT1 = 0x0081
+    RTP_HEADER_PART1 = 22
+
+    selected = [p for p in rtp_packets
+                if p['sourcesync'] == ssrc and p['payload_type'] == pt]
+    if not selected:
+        return False
+
+    # Sort by sequence number; keep first duplicate.
+    selected.sort(key=lambda x: x['sequence'])
+    seen_seq = set()
+    unique = []
+    for p in selected:
+        if p['sequence'] not in seen_seq:
+            seen_seq.add(p['sequence'])
+            unique.append(p)
+
+    try:
+        with open(voip_file, 'wb') as f:
+            # Arbitrary start time; EVS_dec VOIP mode only needs monotonic times.
+            rcv_time_ms = 0
+            for p in unique:
+                payload = p['payload']
+                rtp_packet_size = 12 + len(payload)
+                # Host byte order (decoder reads these as native uint32/uint16)
+                f.write(struct.pack('<I', rtp_packet_size))
+                f.write(struct.pack('<I', rcv_time_ms))
+                f.write(struct.pack('<H', RTP_HEADER_PART1))
+                f.write(struct.pack('>H', p['sequence']))
+                f.write(struct.pack('>I', p['timestamp']))
+                f.write(struct.pack('<I', ssrc))
+                num_bits = len(payload) * 8
+                f.write(struct.pack('<H', G192_SYNC_GOOD_FRAME))
+                f.write(struct.pack('<H', num_bits))
+                for byte in payload:
+                    for i in range(7, -1, -1):
+                        bit = (byte >> i) & 1
+                        f.write(struct.pack('<H', G192_BIT1 if bit else G192_BIT0))
+                rcv_time_ms += 20
+        return True
+    except Exception as e:
+        logging.error('Failed to write VOIP file {}: {}'.format(voip_file, e))
+        return False
+
+
+def convert_evs_to_wav(rtp_packets, ssrc, pt, wav_file, sample_rate):
+    '''
+    Convert an EVS RTP flow to WAV using the 3GPP EVS reference decoder
+    in VOIP mode. The decoder receives a G.192 VOIP file and outputs raw
+    16-bit PCM, which is then wrapped in a WAV container.
+    Returns True on success, False on failure.
+    '''
+    evs_dec = find_evs_decoder()
+    if not evs_dec:
+        print('EVS_dec not found; cannot convert EVS to WAV. Set EVS_DEC env var.')
+        return False
+
+    # Output sample rate for EVS_dec: 8, 16, 32 or 48 kHz.
+    fs_map = {8000: 8, 16000: 16, 32000: 32, 48000: 48}
+    if sample_rate not in fs_map:
+        print('Unsupported EVS output sample rate: {} Hz'.format(sample_rate))
+        return False
+    fs_khz = fs_map[sample_rate]
+
+    tmpdir = os.path.dirname(wav_file) or '.'
+    voip_file = os.path.join(tmpdir, 'tmp_evs_voip_{:08x}_{}.g192'.format(ssrc, pt))
+    raw_file = voip_file + '.16k'
+
+    if not write_evs_voip_file(rtp_packets, ssrc, pt, voip_file):
+        return False
+
+    cmd = [evs_dec, '-VOIP', '-q', str(fs_khz), voip_file, raw_file]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print('EVS_dec conversion failed:')
+            print(result.stderr[-1000:])
+            return False
+    except Exception as e:
+        print('Error running EVS_dec: {}'.format(e))
+        return False
+    finally:
+        try:
+            os.remove(voip_file)
+        except OSError:
+            pass
+
+    if not os.path.isfile(raw_file):
+        print('EVS_dec did not produce output file')
+        return False
+
+    # Wrap raw 16-bit host-endian PCM in WAV.
+    try:
+        with open(raw_file, 'rb') as f:
+            pcm = f.read()
+        with wave.open(wav_file, 'wb') as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            w.writeframes(pcm)
+        print('Converted to WAV: {}'.format(wav_file))
+        return True
+    except Exception as e:
+        print('Error writing WAV from EVS_dec output: {}'.format(e))
+        return False
+    finally:
+        try:
+            os.remove(raw_file)
+        except OSError:
+            pass
+
+
 def convert_to_wav(amr_file, wav_file, sample_rate):
     '''
-    Convert the produced AMR/AMR-WB/EVS file to WAV using ffmpeg.
+    Convert the produced AMR/AMR-WB file to WAV using ffmpeg.
     The output is mono PCM. A small headroom limiter is applied so that
     hard-clipped peaks (common with AMR-NB decodes) do not sit at digital
     full scale, which can confuse some players/editors.
@@ -642,6 +774,207 @@ def mix_wavs(wav_files, out_wav, sample_rate, delays=None):
     except Exception as e:
         print('Error running ffmpeg mix: {}'.format(e))
         return None
+
+
+def mix_to_mono(wav_files, out_wav, sample_rate, delays=None):
+    '''
+    Mix multiple mono WAV files down to a single mono WAV using ffmpeg.
+    If delays is provided, each input is delayed by the given number of
+    samples so streams are aligned by pcap capture time before summing.
+    Returns True on success, False on failure.
+    '''
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        print('ffmpeg not found; cannot mix to mono')
+        return False
+
+    if not wav_files:
+        return False
+
+    if delays is None:
+        delays = [0] * len(wav_files)
+    elif len(delays) != len(wav_files):
+        delays = list(delays) + [0] * (len(wav_files) - len(delays))
+
+    valid_files = []
+    valid_delays = []
+    for wf, d in zip(wav_files, delays):
+        try:
+            with wave.open(wf, 'rb') as w:
+                if w.getnchannels() == 0:
+                    continue
+            valid_files.append(wf)
+            valid_delays.append(d)
+        except Exception as e:
+            logging.debug('Skipping {} for mono mix: {}'.format(wf, e))
+
+    if not valid_files:
+        print('No valid WAV files to mix to mono')
+        return False
+
+    try:
+        if len(valid_files) == 1:
+            cmd = [
+                ffmpeg, '-y', '-i', valid_files[0],
+                '-ar', str(sample_rate), '-ac', '1',
+                '-map_metadata', '-1', '-fflags', '+bitexact',
+                out_wav
+            ]
+        else:
+            inputs = []
+            filter_parts = []
+            for i, wf in enumerate(valid_files):
+                inputs.extend(['-i', wf])
+                delay_ms = int(round(valid_delays[i] * 1000.0 / sample_rate))
+                filters = 'aresample={sr},aformat=channel_layouts=mono'.format(sr=sample_rate)
+                if delay_ms > 0:
+                    filters += ',adelay=delays={ms}|{ms}:all=1'.format(ms=delay_ms)
+                filter_parts.append('[{i}:a]{filters}[a{i}]'.format(
+                    i=i, filters=filters))
+            merge = ''.join('[a{}]'.format(i) for i in range(len(valid_files)))
+            filter_complex = ';'.join(filter_parts) + ';' + merge + \
+                'amix=inputs={}:duration=longest:normalize=0[aout]'.format(len(valid_files))
+            cmd = [
+                ffmpeg, '-y',
+            ] + inputs + [
+                '-filter_complex', filter_complex,
+                '-map', '[aout]',
+                '-ar', str(sample_rate), '-ac', '1',
+                '-map_metadata', '-1', '-fflags', '+bitexact',
+                out_wav
+            ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print('ffmpeg mono mix failed:')
+            print(result.stderr[-1000:])
+            return False
+        print('Mixed direction WAV: {}'.format(out_wav))
+        return True
+    except Exception as e:
+        print('Error running ffmpeg mono mix: {}'.format(e))
+        return False
+
+
+def join_to_stereo(left_wav, right_wav, out_wav, sample_rate):
+    '''
+    Join two mono WAV files into a single stereo WAV file.
+    Left channel = left_wav, right channel = right_wav.
+    Shorter inputs are padded with silence so the stereo output is as long as
+    the longest input.
+    Returns True on success, False on failure.
+    '''
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        print('ffmpeg not found; cannot join stereo')
+        return False
+
+    try:
+        with wave.open(left_wav, 'rb') as w:
+            left_frames = w.getnframes()
+        with wave.open(right_wav, 'rb') as w:
+            right_frames = w.getnframes()
+        max_samples = max(left_frames, right_frames)
+    except Exception as e:
+        print('Could not read input WAVs for stereo join: {}'.format(e))
+        return False
+
+    filter_complex = (
+        '[0:a]apad=whole_len={max_samples}[left];'
+        '[1:a]apad=whole_len={max_samples}[right];'
+        '[left][right]join=inputs=2:channel_layout=stereo[aout]'
+    ).format(max_samples=max_samples)
+
+    cmd = [
+        ffmpeg, '-y',
+        '-i', left_wav, '-i', right_wav,
+        '-filter_complex', filter_complex,
+        '-map', '[aout]',
+        '-ar', str(sample_rate),
+        '-map_metadata', '-1', '-fflags', '+bitexact',
+        out_wav
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print('ffmpeg stereo join failed:')
+            print(result.stderr[-1000:])
+            return False
+        print('Stereo direction WAV: {}'.format(out_wav))
+        return True
+    except Exception as e:
+        print('Error running ffmpeg stereo join: {}'.format(e))
+        return False
+
+
+def _parse_endpoint(endpoint_str):
+    '''Parse an "ip:port" string, returning (ip, port).'''
+    ip, port = endpoint_str.rsplit(':', 1)
+    return ip, int(port)
+
+
+def generate_direction_mixes(results, outdir, sample_rate):
+    '''
+    For every RTP endpoint (ip:port) seen in the results, create:
+      - ipport_<ip>_<port>_incoming.wav : all streams received at that socket
+      - ipport_<ip>_<port>_outgoing.wav : all streams sent from that socket
+      - ipport_<ip>_<port>_stereo.wav   : stereo file (incoming left, outgoing right)
+    All files are aligned to the earliest pcap time of the endpoint's flows.
+    Returns a dict mapping 'ip:port' -> {'incoming': path, 'outgoing': path, 'stereo': path}.
+    '''
+    # Parse discrete src/dst endpoints from the human-readable strings.
+    for r in results:
+        if not r.get('wavfile'):
+            continue
+        if 'src_endpoint' not in r:
+            r['src_endpoint'] = r['src']
+        if 'dst_endpoint' not in r:
+            r['dst_endpoint'] = r['dst']
+
+    endpoints = set()
+    for r in results:
+        if r.get('wavfile'):
+            endpoints.add(r['src_endpoint'])
+            endpoints.add(r['dst_endpoint'])
+
+    mixes = {}
+    for ep in sorted(endpoints):
+        incoming = [r for r in results if r.get('wavfile') and r.get('dst_endpoint') == ep]
+        outgoing = [r for r in results if r.get('wavfile') and r.get('src_endpoint') == ep]
+        if not incoming and not outgoing:
+            continue
+
+        relevant = incoming + outgoing
+        first_times = [r['first_pcap_time'] for r in relevant if r.get('first_pcap_time') is not None]
+        if not first_times:
+            continue
+        t0 = min(first_times)
+
+        ep_safe = sanitize_filename(ep.replace(':', '_'))
+        incoming_wav = None
+        outgoing_wav = None
+
+        if incoming:
+            wavs = [r['wavfile'] for r in incoming]
+            delays = [int(round((r['first_pcap_time'] - t0) * sample_rate))
+                      if r.get('first_pcap_time') is not None else 0 for r in incoming]
+            incoming_wav = os.path.join(outdir, 'ipport_{}_incoming.wav'.format(ep_safe))
+            if mix_to_mono(wavs, incoming_wav, sample_rate, delays=delays):
+                mixes.setdefault(ep, {})['incoming'] = incoming_wav
+
+        if outgoing:
+            wavs = [r['wavfile'] for r in outgoing]
+            delays = [int(round((r['first_pcap_time'] - t0) * sample_rate))
+                      if r.get('first_pcap_time') is not None else 0 for r in outgoing]
+            outgoing_wav = os.path.join(outdir, 'ipport_{}_outgoing.wav'.format(ep_safe))
+            if mix_to_mono(wavs, outgoing_wav, sample_rate, delays=delays):
+                mixes.setdefault(ep, {})['outgoing'] = outgoing_wav
+
+        if incoming_wav and outgoing_wav and os.path.isfile(incoming_wav) and os.path.isfile(outgoing_wav):
+            stereo_wav = os.path.join(outdir, 'ipport_{}_stereo.wav'.format(ep_safe))
+            if join_to_stereo(incoming_wav, outgoing_wav, stereo_wav, sample_rate):
+                mixes[ep]['stereo'] = stereo_wav
+
+    return mixes
 
 
 def write_flow_pcap(packets, ssrc, pt, out_pcap):
@@ -1215,18 +1548,26 @@ def usage():
     print('  -ar rate       WAV output sample rate in Hz (default: 16000)')
     print('  --pcaps        also write one pcap per RTP flow (ssrc/pt)')
     print('  --mix          also create one multichannel WAV from all flow WAVs')
+    print('  --direction-mix  create per-IP:port incoming/outgoing/stereo WAV mixes')
     print('  --no-align-time  with --mix: start all channels at time 0 instead of aligning by pcap time')
     print('If -o is used, only the busiest matching flow is extracted.')
     print('Otherwise, every matching RTP flow is extracted to its own file.')
 
 
-def determine_flow_codecs(flows, rtp_packets, framing, sdp_hints):
+def determine_flow_codecs(flows, rtp_packets, framing, sdp_hints, codec='guess'):
     '''
     Return a dict mapping each flow to the most likely codec.
     If a codec is explicitly specified globally, all flows use it.
     If guessing, use SDP hints and payload sizes per flow.
     '''
     flow_codecs = {}
+
+    # Explicit codec overrides everything, including possibly wrong SDP.
+    if codec != 'guess':
+        for flow in flows:
+            flow_codecs[flow] = codec
+        return flow_codecs
+
     ietf_sets = {
         'amr': set(amr_payload_sizes),
         'amr-wb': set(amrwb_payload_sizes),
@@ -1263,11 +1604,11 @@ def determine_flow_codecs(flows, rtp_packets, framing, sdp_hints):
 
 
 def generate_report(outdir, args, packets, rtp_packets, flows, flow_codecs,
-                    results, sip_dialogs, flow_labels):
+                    results, sip_dialogs, flow_labels, direction_mixes=None):
     '''
     Write a human-friendly README.md report into the output directory.
     Includes run details, SIP call summary, RTP flow table, pairing guide,
-    diagrams and listening instructions.
+    per-IP direction mixes, diagrams and listening instructions.
     '''
     report_path = os.path.join(outdir, 'README.md')
     result_by_flow = {(r['ssrc'], r['pt']): r for r in results}
@@ -1478,6 +1819,24 @@ def generate_report(outdir, args, packets, rtp_packets, flows, flow_codecs,
         lines.append('No SIP signaling available, so no A/B party diagram can be drawn.')
         lines.append('')
 
+    # Per-endpoint direction mixes
+    if direction_mixes:
+        lines.append('## Per-Endpoint (IP:port) Direction Mixes')
+        lines.append('')
+        lines.append('For every RTP socket (IP:port), the traffic **entering** that socket and **leaving** that socket has been mixed into separate mono files. A stereo file is also provided (incoming = left channel, outgoing = right channel).')
+        lines.append('')
+        lines.append('| Endpoint (IP:port) | Incoming (received) | Outgoing (sent) | Stereo |')
+        lines.append('|---|---|---|---|')
+        for ep in sorted(direction_mixes.keys()):
+            files = direction_mixes[ep]
+            inc = os.path.basename(files['incoming']) if files.get('incoming') else '-'
+            out = os.path.basename(files['outgoing']) if files.get('outgoing') else '-'
+            ster = os.path.basename(files['stereo']) if files.get('stereo') else '-'
+            lines.append('| `{}` | `{}` | `{}` | `{}` |'.format(ep, inc, out, ster))
+        lines.append('')
+        lines.append('**Listening tip:** Open the stereo file in Audacity. The left ear is everything that socket **heard**; the right ear is everything that socket **said**.')
+        lines.append('')
+
     # How to listen
     lines.append('## How to Listen / Use the Files')
     lines.append('')
@@ -1523,11 +1882,15 @@ if __name__ == '__main__':
                         help='Also create one multichannel WAV mixing all flow WAVs (one channel per flow)')
     parser.add_argument('--no-align-time', action='store_true', dest='no_align_time', default=False,
                         help='When mixing, start all channels at time 0 instead of aligning by pcap capture time')
+    parser.add_argument('--direction-mix', action='store_true', dest='direction_mix', default=False,
+                        help='Create per-IP:port direction mixes (incoming/outgoing/stereo)')
 
     args = parser.parse_args()
 
     # Mixing requires per-flow WAVs.
     if args.mix and not args.wav:
+        args.wav = True
+    if args.direction_mix and not args.wav:
         args.wav = True
 
     logging.basicConfig(filename='pcap_parser.log', filemode='w', level=logging.DEBUG)
@@ -1603,10 +1966,11 @@ if __name__ == '__main__':
         matching_flows = []
         for flow in all_flows:
             ssrc, pt = flow
-            # If SDP hints exist, only accept PTs that SDP maps to this codec.
-            if sdp_hints:
-                if pt not in sdp_hints or sdp_hints[pt] != codec:
-                    continue
+            # When the codec is explicitly forced, do NOT require the SDP to
+            # agree. PCAPs with misleading/wrong SDP (e.g. declared AMR but
+            # actually EVS) would otherwise be rejected.
+            if sdp_hints and pt in sdp_hints and sdp_hints[pt] == codec:
+                pass  # SDP agrees, fine
             # Accept if payload sizes match and we have enough frames.
             flow_packets = [p for p in rtp_packets
                             if (p['sourcesync'], p['payload_type']) == flow]
@@ -1625,7 +1989,7 @@ if __name__ == '__main__':
                         if (p['sourcesync'], p['payload_type']) == f) >= MIN_FRAMES]
 
     # Determine codec per flow.
-    flow_codecs = determine_flow_codecs(flows, rtp_packets, framing, sdp_hints)
+    flow_codecs = determine_flow_codecs(flows, rtp_packets, framing, sdp_hints, codec)
 
     # Parse SIP signaling to label RTP directions and build a report.
     sip_messages = extract_sip_messages(packets)
@@ -1708,7 +2072,11 @@ if __name__ == '__main__':
 
         if args.wav:
             wavfile = outfile + '.wav'
-            if convert_to_wav(outfile, wavfile, args.sample_rate):
+            if flow_codec == 'evs':
+                ok = convert_evs_to_wav(rtp_packets, ssrc, pt, wavfile, args.sample_rate)
+            else:
+                ok = convert_to_wav(outfile, wavfile, args.sample_rate)
+            if ok:
                 stats['wavfile'] = wavfile
                 stats['level'] = analyze_wav_level(wavfile)
             else:
@@ -1791,8 +2159,26 @@ if __name__ == '__main__':
         else:
             print('No WAV files available to mix')
 
+    direction_mixes = {}
+    if args.direction_mix:
+        direction_mixes = generate_direction_mixes(results, outdir, args.sample_rate)
+        if direction_mixes:
+            print('\n=== Per-Endpoint (IP:port) Direction Mixes ===')
+            for ep in sorted(direction_mixes.keys()):
+                files = direction_mixes[ep]
+                print('  {}:'.format(ep))
+                if files.get('incoming'):
+                    print('    incoming -> {}'.format(os.path.basename(files['incoming'])))
+                if files.get('outgoing'):
+                    print('    outgoing -> {}'.format(os.path.basename(files['outgoing'])))
+                if files.get('stereo'):
+                    print('    stereo   -> {} (incoming=left, outgoing=right)'.format(
+                        os.path.basename(files['stereo'])))
+        else:
+            print('No per-IP direction mixes generated')
+
     # Write a human-friendly README report into the output folder.
     generate_report(outdir, args, packets, rtp_packets, flows, flow_codecs,
-                    results, sip_dialogs, flow_labels)
+                    results, sip_dialogs, flow_labels, direction_mixes)
 
     exit(0)

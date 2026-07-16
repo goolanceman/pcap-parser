@@ -21,5 +21,9 @@ __pycache__/
 *.pyo
 
 output
-olddata
+oldpdata
 pcaps
+
+# SSH keys
+id_ed25519
+id_ed25519.pub
