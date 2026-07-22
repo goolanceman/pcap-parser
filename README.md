@@ -45,7 +45,7 @@ Extract AMR, AMR-WB, and EVS audio from RTP pcaps and convert it to playable WAV
 - **Preserves silent / DTX periods** by inserting silence frames for RTP timestamp gaps and replacing SID frames with decodable silence so `ffmpeg` does not drop them.
 - Optional **per-flow RTP pcap export** (`--pcaps`) for Wireshark analysis.
 - Optional **multichannel mix** (`--mix`) combining all flow WAVs into one file with one channel per flow, aligned by **pcap capture time** (Wireshark RTP-player style). Use `--no-align-time` to start all channels at 0.
-- Optional **per-endpoint direction mixes** (`--direction-mix`): for every RTP socket (IP:port) the script creates incoming, outgoing and stereo WAVs (left = incoming, right = outgoing).
+- Optional **per-endpoint direction mixes** (`--direction-mix`): for every RTP socket (IP:port) the script creates incoming, outgoing and stereo WAVs (left = incoming, right = outgoing), plus a single `mixed_all_endpoints.wav` with one channel per endpoint+direction and a matching `mixed_all_endpoints_channels.txt` map.
 - Automatic **per-folder README report** in multi-flow mode with SIP call summary, A/B party direction labels, per-endpoint mixes, Mermaid + ASCII diagrams, and a listening guide.
 
 ---
@@ -168,6 +168,7 @@ This produces:
 - Per-flow `.pcap` files for Wireshark
 - `mixed_all_flows.wav` with one channel per flow
 - `ipport_<ip>_<port>_{incoming,outgoing,stereo}.wav` for every RTP socket
+- `mixed_all_endpoints.wav` + `mixed_all_endpoints_channels.txt`
 - `README.md` with SIP/RTP analysis and diagrams
 
 ---
@@ -215,6 +216,8 @@ When `--direction-mix` is used you also get:
 - `ipport_<ip>_<port>_incoming.wav`
 - `ipport_<ip>_<port>_outgoing.wav`
 - `ipport_<ip>_<port>_stereo.wav`
+- `mixed_all_endpoints.wav` — one multichannel file with one channel per endpoint+direction
+- `mixed_all_endpoints_channels.txt` — channel map (because WAV files cannot store track names that Audacity will display)
 
 ---
 
@@ -232,7 +235,7 @@ When `--direction-mix` is used you also get:
 8. If `--wav` is set, runs `ffmpeg` to convert to WAV at the requested sample rate.
 9. If `--pcaps` is set, writes the original packets for each flow to a separate `.pcap` file.
 10. If `--mix` is set, combines all flow WAVs into a single multichannel WAV aligned by pcap capture time, unless `--no-align-time` is used.
-11. If `--direction-mix` is set, creates incoming / outgoing / stereo mixes for every RTP socket (IP:port).
+11. If `--direction-mix` is set, creates incoming / outgoing / stereo mixes for every RTP socket (IP:port), plus a single `mixed_all_endpoints.wav` with a sidecar channel map.
 12. Reports the RMS / peak level for each WAV and flags flows that are silent or extremely quiet.
 13. Writes a per-folder `README.md` with SIP call summary, A/B direction labels, per-endpoint mixes, diagrams, and listening instructions.
 

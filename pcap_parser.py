@@ -617,7 +617,8 @@ def convert_to_wav(amr_file, wav_file, sample_rate):
         return False
 
     sr = str(sample_rate)
-    af = 'aresample={}:resampler=soxr,alimiter=level=false:limit=-0.5dB'.format(sr)
+    # Use ffmpeg's default SW resampler (soxr may not be available in all builds).
+    af = 'aresample={},alimiter=level=false:limit=-0.5dB'.format(sr)
 
     cmd = [
         ffmpeg, '-y', '-i', amr_file,
@@ -918,8 +919,12 @@ def generate_direction_mixes(results, outdir, sample_rate):
       - ipport_<ip>_<port>_incoming.wav : all streams received at that socket
       - ipport_<ip>_<port>_outgoing.wav : all streams sent from that socket
       - ipport_<ip>_<port>_stereo.wav   : stereo file (incoming left, outgoing right)
+      - mixed_all_endpoints.wav         : one multichannel file with one channel
+                                          per endpoint+direction, aligned by pcap time
+      - mixed_all_endpoints_channels.txt: channel map for the multichannel file
     All files are aligned to the earliest pcap time of the endpoint's flows.
-    Returns a dict mapping 'ip:port' -> {'incoming': path, 'outgoing': path, 'stereo': path}.
+    Returns a dict mapping 'ip:port' -> {'incoming': path, 'outgoing': path, 'stereo': path}
+    plus a special '__combined__' key with the multichannel mix and channel map.
     '''
     # Parse discrete src/dst endpoints from the human-readable strings.
     for r in results:
@@ -937,6 +942,9 @@ def generate_direction_mixes(results, outdir, sample_rate):
             endpoints.add(r['dst_endpoint'])
 
     mixes = {}
+    # Track each endpoint+direction that will become a channel in the combined mix.
+    combined_channels = []
+
     for ep in sorted(endpoints):
         incoming = [r for r in results if r.get('wavfile') and r.get('dst_endpoint') == ep]
         outgoing = [r for r in results if r.get('wavfile') and r.get('src_endpoint') == ep]
@@ -960,6 +968,12 @@ def generate_direction_mixes(results, outdir, sample_rate):
             incoming_wav = os.path.join(outdir, 'ipport_{}_incoming.wav'.format(ep_safe))
             if mix_to_mono(wavs, incoming_wav, sample_rate, delays=delays):
                 mixes.setdefault(ep, {})['incoming'] = incoming_wav
+                combined_channels.append({
+                    'endpoint': ep,
+                    'direction': 'incoming',
+                    'wavfile': incoming_wav,
+                    't0': t0,
+                })
 
         if outgoing:
             wavs = [r['wavfile'] for r in outgoing]
@@ -968,11 +982,45 @@ def generate_direction_mixes(results, outdir, sample_rate):
             outgoing_wav = os.path.join(outdir, 'ipport_{}_outgoing.wav'.format(ep_safe))
             if mix_to_mono(wavs, outgoing_wav, sample_rate, delays=delays):
                 mixes.setdefault(ep, {})['outgoing'] = outgoing_wav
+                combined_channels.append({
+                    'endpoint': ep,
+                    'direction': 'outgoing',
+                    'wavfile': outgoing_wav,
+                    't0': t0,
+                })
 
         if incoming_wav and outgoing_wav and os.path.isfile(incoming_wav) and os.path.isfile(outgoing_wav):
             stereo_wav = os.path.join(outdir, 'ipport_{}_stereo.wav'.format(ep_safe))
             if join_to_stereo(incoming_wav, outgoing_wav, stereo_wav, sample_rate):
                 mixes[ep]['stereo'] = stereo_wav
+
+    # Build one multichannel WAV with one channel per endpoint+direction.
+    if len(combined_channels) >= 2:
+        global_t0 = min(ch['t0'] for ch in combined_channels)
+        wav_files = []
+        delays = []
+        for ch in combined_channels:
+            wav_files.append(ch['wavfile'])
+            delays.append(int(round((ch['t0'] - global_t0) * sample_rate)))
+        combined_wav = os.path.join(outdir, 'mixed_all_endpoints.wav')
+        mix_info = mix_wavs(wav_files, combined_wav, sample_rate, delays=delays)
+        if mix_info:
+            channels_file = os.path.join(outdir, 'mixed_all_endpoints_channels.txt')
+            try:
+                with open(channels_file, 'w', encoding='utf-8') as f:
+                    f.write('# Channel map for mixed_all_endpoints.wav\n')
+                    f.write('# Left = incoming to the socket, Right = outgoing from the socket (when stereo).\n')
+                    f.write('# Each line: Channel N = <endpoint> <direction>\n')
+                    for idx, ch in enumerate(combined_channels, start=1):
+                        f.write('Channel {} = {} {}\n'.format(idx, ch['endpoint'], ch['direction']))
+                print('Wrote channel map: {}'.format(channels_file))
+            except Exception as e:
+                print('Could not write channel map: {}'.format(e))
+            mixes['__combined__'] = {
+                'wavfile': combined_wav,
+                'channels_file': channels_file,
+                'channels': len(combined_channels),
+            }
 
     return mixes
 
@@ -1828,6 +1876,8 @@ def generate_report(outdir, args, packets, rtp_packets, flows, flow_codecs,
         lines.append('| Endpoint (IP:port) | Incoming (received) | Outgoing (sent) | Stereo |')
         lines.append('|---|---|---|---|')
         for ep in sorted(direction_mixes.keys()):
+            if ep == '__combined__':
+                continue
             files = direction_mixes[ep]
             inc = os.path.basename(files['incoming']) if files.get('incoming') else '-'
             out = os.path.basename(files['outgoing']) if files.get('outgoing') else '-'
@@ -1836,6 +1886,37 @@ def generate_report(outdir, args, packets, rtp_packets, flows, flow_codecs,
         lines.append('')
         lines.append('**Listening tip:** Open the stereo file in Audacity. The left ear is everything that socket **heard**; the right ear is everything that socket **said**.')
         lines.append('')
+
+        combined = direction_mixes.get('__combined__')
+        if combined:
+            lines.append('### Single combined endpoint-direction mix')
+            lines.append('')
+            lines.append('`{}` is a single multichannel WAV that contains every endpoint+direction on its own channel, aligned by pcap capture time.'.format(os.path.basename(combined['wavfile'])))
+            lines.append('')
+            lines.append('Open it in Audacity and choose **Split to mono tracks**. Each track is named in `{}`.'.format(os.path.basename(combined['channels_file'])))
+            lines.append('')
+            lines.append('| Channel | Endpoint (IP:port) | Direction |')
+            lines.append('|---|---|---|')
+            try:
+                with open(combined['channels_file'], 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        # Format: "Channel N = ep direction"
+                        parts = line.split('=', 1)
+                        if len(parts) != 2:
+                            continue
+                        chan = parts[0].strip()
+                        rest = parts[1].strip().rsplit(' ', 1)
+                        if len(rest) == 2:
+                            ep_name, direction = rest
+                            lines.append('| `{}` | `{}` | `{}` |'.format(chan, ep_name, direction))
+            except Exception:
+                pass
+            lines.append('')
+            lines.append('**Tip for non-technical users:** channel order = one endpoint after another; for each endpoint the incoming channel comes first, then the outgoing channel.')
+            lines.append('')
 
     # How to listen
     lines.append('## How to Listen / Use the Files')
@@ -2165,6 +2246,8 @@ if __name__ == '__main__':
         if direction_mixes:
             print('\n=== Per-Endpoint (IP:port) Direction Mixes ===')
             for ep in sorted(direction_mixes.keys()):
+                if ep == '__combined__':
+                    continue
                 files = direction_mixes[ep]
                 print('  {}:'.format(ep))
                 if files.get('incoming'):
@@ -2174,6 +2257,12 @@ if __name__ == '__main__':
                 if files.get('stereo'):
                     print('    stereo   -> {} (incoming=left, outgoing=right)'.format(
                         os.path.basename(files['stereo'])))
+            combined = direction_mixes.get('__combined__')
+            if combined:
+                print('\nCombined endpoint-direction mix:')
+                print('  WAV:    {}'.format(os.path.basename(combined['wavfile'])))
+                print('  Map:    {}'.format(os.path.basename(combined['channels_file'])))
+                print('  Channels: {}'.format(combined['channels']))
         else:
             print('No per-IP direction mixes generated')
 
