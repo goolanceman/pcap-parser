@@ -1249,7 +1249,9 @@ def extract_flow(rtp_packets, ssrc, pt, codec, framing, outfile):
         'control_frames': num_control_frames,
         'first_ts': selected[0]['timestamp'] if selected else None,
         'last_ts': selected[-1]['timestamp'] if selected else None,
-        'first_pcap_time': selected[0]['pcap_time'] if selected else None,
+        # Align by the actual earliest arrival time in the pcap, not the first
+        # sorted sequence number (packets can arrive out of order).
+        'first_pcap_time': min(p['pcap_time'] for p in selected) if selected else None,
     }
 
 
